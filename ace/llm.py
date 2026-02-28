@@ -366,8 +366,11 @@ class OpenAIClient(LLMClient):
             "temperature": kwargs.get("temperature", self.temperature),
         }
         if self.max_output_tokens is not None:
-            # different name in chat API
-            request_kwargs["max_tokens"] = self.max_output_tokens
+            # gpt-5-nano 和新模型使用 max_completion_tokens，旧模型使用 max_tokens
+            if "gpt-5" in self.model or "o1" in self.model or "o3" in self.model:
+                request_kwargs["max_completion_tokens"] = self.max_output_tokens
+            else:
+                request_kwargs["max_tokens"] = self.max_output_tokens
 
         request_kwargs.update(self.extra_request_kwargs)
         request_kwargs.update(kwargs)

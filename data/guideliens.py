@@ -30,7 +30,7 @@ def load_hf_dataset(dataset_path_or_name: str,
     return ds
 
 ds = load_hf_dataset("epfl-llm/guidelines")
-import pdb;pdb.set_trace()
+#import pdb;pdb.set_trace()
 print(ds.keys())
 from collections import defaultdict
 guidelines, _guidelines = [], []
@@ -65,7 +65,7 @@ for entry in ds['train']:
          
     
 import json
-import pdb;pdb.set_trace()
+#import pdb;pdb.set_trace()
 with open('guideline_ready.json', 'w') as f:
     json.dump(guidelines, f, indent=4)
 with open('guideline_incomp.json', 'w') as f:

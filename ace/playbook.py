@@ -855,6 +855,7 @@ class GuidelinePlaybook:
         *,
         include_embeddings: bool = False,
         include_timestamps: bool = True,
+        max_bullets_per_section: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Export the playbook as a hierarchical dict:
@@ -901,8 +902,11 @@ class GuidelinePlaybook:
                 sec_dict["embedding"] = sec.embedding
 
             bullets_payload: List[Dict[str, Any]] = []
-            # 按 section.bullet_ids 的顺序导出
-            for bid in sec.bullet_ids:
+            # 按 section.bullet_ids 的顺序导出，可选截断
+            bullet_ids_to_export = sec.bullet_ids
+            if max_bullets_per_section is not None:
+                bullet_ids_to_export = sec.bullet_ids[:max_bullets_per_section]
+            for bid in bullet_ids_to_export:
                 bullet = self._bullets.get(bid)
                 if bullet is None:
                     continue
@@ -938,12 +942,56 @@ class GuidelinePlaybook:
         include_timestamps: bool = True,
         indent: int = 2,
         ensure_ascii: bool = False,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """
         Convenience wrapper: export as JSON string with hierarchical structure.
+
+        If max_tokens is specified, will progressively reduce bullets per section
+        until the JSON fits within the token limit.
         """
+        if max_tokens is None:
+            # 无截断
+            data = self.to_hierarchical_dict(
+                include_embeddings=include_embeddings,
+                include_timestamps=include_timestamps,
+            )
+            return json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)
+
+        # 使用 tiktoken 进行截断
+        try:
+            import tiktoken
+            enc = tiktoken.encoding_for_model("gpt-4o-mini")
+        except ImportError:
+            # 如果没有 tiktoken，使用字符数估算 (约 4 字符 = 1 token)
+            enc = None
+
+        def count_tokens(text: str) -> int:
+            if enc is not None:
+                return len(enc.encode(text))
+            return len(text) // 4
+
+        # 找出每个 section 的最大 bullet 数
+        max_bullets = max(
+            (len(sec.bullet_ids) for sec in self._sections.values()),
+            default=0
+        )
+
+        # 逐步减少每个 section 的 bullets 数量
+        for limit in range(max_bullets, 0, -1):
+            data = self.to_hierarchical_dict(
+                include_embeddings=include_embeddings,
+                include_timestamps=include_timestamps,
+                max_bullets_per_section=limit,
+            )
+            json_str = json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)
+            if count_tokens(json_str) <= max_tokens:
+                return json_str
+
+        # 如果即使每个 section 只保留 1 个 bullet 也超限，返回最小版本
         data = self.to_hierarchical_dict(
             include_embeddings=include_embeddings,
             include_timestamps=include_timestamps,
+            max_bullets_per_section=1,
         )
         return json.dumps(data, ensure_ascii=ensure_ascii, indent=indent)

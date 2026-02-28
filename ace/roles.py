@@ -14,8 +14,18 @@ from .prompts import CURATOR_PROMPT, GENERATOR_PROMPT, REFLECTOR_PROMPT
 
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
+    # 尝试提取 markdown 代码块中的 JSON
+    import re
+    cleaned_text = text.strip()
+
+    # 匹配 ```json ... ``` 或 ``` ... ``` 代码块
+    code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    match = re.search(code_block_pattern, cleaned_text, re.DOTALL)
+    if match:
+        cleaned_text = match.group(1).strip()
+
     try:
-        data = json.loads(text)
+        data = json.loads(cleaned_text)
     except json.JSONDecodeError as exc:
         debug_path = Path("logs/json_failures.log")
         debug_path.parent.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,10 @@ from .roles import GeneratorOutput, _safe_json_loads
 RETRIEVAL_SECTION_ID = "sec-retrieval"
 RETRIEVAL_SECTION_TITLE = "Retrieval Signatures"
 
+# Exclusion Rules Section 的固定ID和标题（用于存储排除规则）
+EXCLUSION_SECTION_ID = "sec-exclusion"
+EXCLUSION_SECTION_TITLE = "Exclusion Rules"
+
 
 # ============================================================================
 # 医疗专用 Prompt 模板 - 支持 Retrieval Signatures 和 Delta Update
@@ -64,41 +68,77 @@ Full Structure:
 ================ FEEDBACK ================
 {feedback}
 
-================ DELTA UPDATE INSTRUCTIONS ================
-You must propose INCREMENTAL updates (Delta Updates), NOT full rewrites.
+================ ANALYSIS INSTRUCTIONS ================
 
-**RETRIEVAL SIGNATURES SECTION** (section_id: "{retrieval_section_id}"):
-This special section stores clinical patterns that help retrieve this guideline from case descriptions.
-Each bullet should capture ONE distinct clinical pattern, such as:
-- Key symptoms combinations (e.g., "Triad of fever, cough, and dyspnea suggests pneumonia")
-- Risk factor profiles (e.g., "Smoker + outdoor worker + lip lesion → consider SCC")
-- Lab/imaging patterns (e.g., "Ground-glass opacity on CT + hypoxemia → consider viral pneumonia")
-- Differential diagnosis cues (e.g., "Painless vs painful ulcer distinguishes malignancy from infection")
+**STEP 1: Determine if prediction is CORRECT or INCORRECT**
 
-When the case reveals NEW retrieval patterns not already in this section, ADD them.
-When existing patterns prove UNHELPFUL or MISLEADING, TAG them as harmful or UPDATE them.
+**IF INCORRECT - Perform Deep Error Analysis:**
 
-**OTHER SECTIONS**:
-- ADD_BULLET: Only for genuinely new clinical insights
-- UPDATE_BULLET: To correct or improve existing content
-- TAG_BULLET: To track usefulness (increment helpful/harmful counters)
-- REMOVE_BULLET: Only for outdated/harmful information
+1. **Error Classification** (choose ONE):
+   - MISSED_KEY_SYMPTOM: Critical symptom/finding was present but ignored
+   - WRONG_DIFFERENTIAL: Confused with a similar disease
+   - INCOMPLETE_REASONING: Reasoning chain was incomplete or flawed
+   - KNOWLEDGE_GAP: Lacked necessary medical knowledge
+
+2. **Differential Analysis** (MOST IMPORTANT for learning):
+   - Why did the model predict the wrong answer instead of the correct one?
+   - What symptoms/findings in THIS case point to the correct answer but NOT the prediction?
+   - What are the KEY DIFFERENTIATORS between these two conditions?
+
+3. **Corrective Patterns** (extract 5-8 patterns):
+   - Patterns that would PREVENT this specific error in future
+   - Each pattern should be generalizable to similar cases
+   - Include NEGATIVE patterns (exclusion rules)
+
+**IF CORRECT - Extract Success Patterns:**
+1. What key findings led to the correct diagnosis?
+2. Extract 2-3 reusable diagnostic patterns
+
+================ RETRIEVAL SIGNATURES ================
+Section ID: "{retrieval_section_id}"
+
+This special section stores clinical patterns for case-to-guideline matching.
+Each bullet should capture ONE distinct clinical pattern:
+- Key symptom combinations
+- Risk factor profiles
+- Lab/imaging patterns
+- Differential diagnosis cues
+
+When case reveals NEW patterns not already present, ADD them.
+When existing patterns are MISLEADING, TAG as harmful or UPDATE.
 
 ================ OUTPUT FORMAT ================
 Return a SINGLE valid JSON object:
 {{
-  "reasoning": "<your analysis>",
+  "is_correct": true or false,
+  "reasoning": "<your detailed analysis>",
+
+  "error_type": "MISSED_KEY_SYMPTOM|WRONG_DIFFERENTIAL|INCOMPLETE_REASONING|KNOWLEDGE_GAP|null",
+  "differential_analysis": {{
+    "predicted": "<model's answer or null if correct>",
+    "correct": "<ground truth>",
+    "key_differentiators": ["<finding that distinguishes correct from predicted>"],
+    "missed_findings": ["<critical finding that was ignored>"]
+  }},
+
   "error_identification": "<specific errors or 'None'>",
   "root_cause_analysis": "<why errors occurred or 'N/A'>",
   "correct_approach": "<correct diagnostic approach>",
   "key_insight": "<reusable clinical takeaway>",
+
   "retrieval_patterns": [
-    "<pattern 1: symptom combination or clinical feature that helps identify this disease>",
-    "<pattern 2: ...>"
+    "<pattern 1>",
+    "<pattern 2>"
   ],
+
+  "exclusion_rules": [
+    "If [finding] present, rule OUT [disease] because [reason]"
+  ],
+
   "bullet_tags": [
     {{"id": "<bullet-id>", "tag": "helpful|harmful|neutral"}}
   ],
+
   "proposed_operations": [
     {{
       "type": "ADD_BULLET|UPDATE_BULLET|TAG_BULLET|REMOVE_BULLET",
@@ -112,10 +152,17 @@ Return a SINGLE valid JSON object:
 }}
 
 IMPORTANT RULES:
-1. For retrieval_patterns: Extract 1-3 key patterns from THIS case that could help retrieve this guideline
-2. These patterns will be automatically converted to ADD_BULLET operations for the Retrieval Signatures section
-3. Only add patterns that are NOT already present in the Retrieval Signatures section
-4. Keep patterns concise (under 100 characters) and distinctive
+1. For INCORRECT cases:
+   - Focus on differential analysis - understand WHY the error happened
+   - Extract 5-8 retrieval_patterns that would help prevent this error
+   - Generate exclusion_rules based on differential analysis
+2. For CORRECT cases:
+   - Extract 2-3 retrieval_patterns that capture the successful reasoning
+   - exclusion_rules can be empty
+3. retrieval_patterns will be auto-converted to ADD_BULLET for Retrieval Signatures section
+4. exclusion_rules will be auto-converted to ADD_BULLET for Exclusion Rules section
+5. Only add patterns NOT already present in the playbook
+6. Make patterns generalizable - avoid case-specific details, focus on reusable clinical logic
 
 Now analyze and produce the JSON:
 """
@@ -231,6 +278,26 @@ class ProposedOperation:
 
 
 @dataclass
+class DifferentialAnalysis:
+    """差异性分析结构（用于错误案例分析）"""
+    predicted: Optional[str] = None
+    correct: Optional[str] = None
+    key_differentiators: List[str] = field(default_factory=list)
+    missed_findings: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> Optional["DifferentialAnalysis"]:
+        if not data:
+            return None
+        return cls(
+            predicted=data.get("predicted"),
+            correct=data.get("correct"),
+            key_differentiators=data.get("key_differentiators", []),
+            missed_findings=data.get("missed_findings", []),
+        )
+
+
+@dataclass
 class MedicalReflectorOutput:
     """MedicalReflector的输出结构"""
     reasoning: str
@@ -238,10 +305,15 @@ class MedicalReflectorOutput:
     root_cause_analysis: str
     correct_approach: str
     key_insight: str
-    retrieval_patterns: List[str]  # 新增：检索模式
+    retrieval_patterns: List[str]  # 检索模式
     bullet_tags: List[BulletTag]
     proposed_operations: List[ProposedOperation]
     raw: Dict[str, Any]
+    # 新增字段
+    is_correct: bool = True  # 预测是否正确
+    error_type: Optional[str] = None  # 错误类型分类
+    differential_analysis: Optional[DifferentialAnalysis] = None  # 差异性分析
+    exclusion_rules: List[str] = field(default_factory=list)  # 排除规则
 
     def to_delta_batch(self, include_retrieval_ops: bool = True) -> DeltaBatch:
         """
@@ -298,18 +370,74 @@ def ensure_retrieval_section(playbook: GuidelinePlaybook) -> GuidelineSection:
     return section
 
 
+def ensure_exclusion_section(playbook: GuidelinePlaybook) -> GuidelineSection:
+    """
+    确保playbook中存在Exclusion Rules section。
+    如果不存在则创建。
+
+    Returns
+    -------
+    GuidelineSection
+        Exclusion Rules section
+    """
+    section = playbook.get_section(EXCLUSION_SECTION_ID)
+    if section is None:
+        section = playbook.add_section(
+            title=EXCLUSION_SECTION_TITLE,
+            section_id=EXCLUSION_SECTION_ID,
+        )
+        # 添加一个初始bullet说明这个section的用途
+        playbook.add_bullet(
+            section_id=EXCLUSION_SECTION_ID,
+            content=f"[META] This section contains exclusion rules - patterns that help rule OUT this condition ({playbook.title}) when certain findings are present.",
+            metadata={"helpful": 0, "harmful": 0},
+        )
+    return section
+
+
 def get_retrieval_signatures(playbook: GuidelinePlaybook) -> List[str]:
     """获取playbook中所有的retrieval signatures"""
     section = playbook.get_section(RETRIEVAL_SECTION_ID)
     if section is None:
         return []
-    
+
     signatures = []
     for bullet_id in section.bullet_ids:
         bullet = playbook.get_bullet(bullet_id)
         if bullet and not bullet.content.startswith("[META]"):
             signatures.append(bullet.content)
     return signatures
+
+
+def get_exclusion_rules(playbook: GuidelinePlaybook) -> List[str]:
+    """获取playbook中所有的exclusion rules"""
+    section = playbook.get_section(EXCLUSION_SECTION_ID)
+    if section is None:
+        return []
+
+    rules = []
+    for bullet_id in section.bullet_ids:
+        bullet = playbook.get_bullet(bullet_id)
+        if bullet and not bullet.content.startswith("[META]"):
+            rules.append(bullet.content)
+    return rules
+
+
+def check_duplicate_exclusion_rule(
+    playbook: GuidelinePlaybook,
+    new_rule: str,
+) -> bool:
+    """
+    检查新的exclusion rule是否与已有的重复。
+    """
+    existing = get_exclusion_rules(playbook)
+    new_lower = new_rule.lower().strip()
+
+    for rule in existing:
+        rule_lower = rule.lower().strip()
+        if new_lower in rule_lower or rule_lower in new_lower:
+            return True
+    return False
 
 
 def check_duplicate_signature(
@@ -374,8 +502,9 @@ class MedicalReflector:
         """
         对Generator的输出进行反思分析，提出Delta Update建议。
         """
-        # 确保Retrieval Signatures section存在
+        # 确保Retrieval Signatures section和Exclusion Rules section存在
         ensure_retrieval_section(playbook)
+        ensure_exclusion_section(playbook)
         
         # 构建playbook摘要
         playbook_excerpt = self._make_playbook_excerpt(playbook, generator_output.bullet_ids)
@@ -432,7 +561,27 @@ class MedicalReflector:
                         for item in ops_payload:
                             if isinstance(item, dict) and "type" in item:
                                 proposed_ops.append(ProposedOperation.from_dict(item))
-                    
+
+                    # 解析新增字段：is_correct, error_type, differential_analysis, exclusion_rules
+                    is_correct = data.get("is_correct", True)
+                    if isinstance(is_correct, str):
+                        is_correct = is_correct.lower() == "true"
+
+                    error_type = data.get("error_type")
+                    if error_type and error_type.lower() == "null":
+                        error_type = None
+
+                    differential_analysis = DifferentialAnalysis.from_dict(
+                        data.get("differential_analysis")
+                    )
+
+                    exclusion_rules: List[str] = []
+                    exclusion_payload = data.get("exclusion_rules", [])
+                    if isinstance(exclusion_payload, list):
+                        for rule in exclusion_payload:
+                            if isinstance(rule, str) and rule.strip():
+                                exclusion_rules.append(rule.strip())
+
                     candidate = MedicalReflectorOutput(
                         reasoning=str(data.get("reasoning", "")),
                         error_identification=str(data.get("error_identification", "")),
@@ -443,11 +592,15 @@ class MedicalReflector:
                         bullet_tags=bullet_tags,
                         proposed_operations=proposed_ops,
                         raw=data,
+                        is_correct=is_correct,
+                        error_type=error_type,
+                        differential_analysis=differential_analysis,
+                        exclusion_rules=exclusion_rules,
                     )
                     result = candidate
-                    
+
                     # 如果有可操作的输出，提前返回
-                    if bullet_tags or proposed_ops or retrieval_patterns or candidate.key_insight:
+                    if bullet_tags or proposed_ops or retrieval_patterns or exclusion_rules or candidate.key_insight:
                         return candidate
                     break
                     
@@ -620,10 +773,11 @@ class MedicalCurator:
         *,
         auto_apply: bool = False,
         deduplicate_retrieval: bool = True,
+        deduplicate_exclusion: bool = True,
     ) -> MedicalCuratorOutput:
         """
         直接使用Reflector的建议（不经过LLM二次验证）。
-        
+
         Parameters
         ----------
         reflection : MedicalReflectorOutput
@@ -634,27 +788,30 @@ class MedicalCurator:
             是否自动应用到playbook
         deduplicate_retrieval : bool
             是否对retrieval patterns进行去重
+        deduplicate_exclusion : bool
+            是否对exclusion rules进行去重
         """
-        # 确保Retrieval Signatures section存在
+        # 确保Retrieval Signatures section和Exclusion Rules section存在
         ensure_retrieval_section(playbook)
-        
+        ensure_exclusion_section(playbook)
+
         # 构建delta batch
         all_ops: List[DeltaOperation] = []
         skipped: List[str] = []
-        
+
         # 1. 添加Reflector提出的操作
         for op in reflection.proposed_operations:
             all_ops.append(op.to_delta_operation())
-        
+
         # 2. 处理retrieval patterns（去重）
         for pattern in reflection.retrieval_patterns:
             if not pattern.strip():
                 continue
-            
+
             if deduplicate_retrieval and check_duplicate_signature(playbook, pattern):
                 skipped.append(f"Duplicate retrieval pattern: {pattern[:50]}...")
                 continue
-            
+
             all_ops.append(DeltaOperation(
                 type="ADD_BULLET",
                 section_id=RETRIEVAL_SECTION_ID,
@@ -662,8 +819,25 @@ class MedicalCurator:
                 metadata={"helpful": 1},
                 note="Retrieval pattern from case",
             ))
-        
-        # 3. 将bullet_tags转换为TAG_BULLET操作
+
+        # 3. 处理exclusion rules（去重）- 新增
+        for rule in reflection.exclusion_rules:
+            if not rule.strip():
+                continue
+
+            if deduplicate_exclusion and check_duplicate_exclusion_rule(playbook, rule):
+                skipped.append(f"Duplicate exclusion rule: {rule[:50]}...")
+                continue
+
+            all_ops.append(DeltaOperation(
+                type="ADD_BULLET",
+                section_id=EXCLUSION_SECTION_ID,
+                content=rule.strip(),
+                metadata={"helpful": 1, "source": "error_analysis"},
+                note=f"Exclusion rule from error case (error_type: {reflection.error_type})",
+            ))
+
+        # 4. 将bullet_tags转换为TAG_BULLET操作
         for tag in reflection.bullet_tags:
             all_ops.append(DeltaOperation(
                 type="TAG_BULLET",
@@ -671,15 +845,15 @@ class MedicalCurator:
                 metadata={tag.tag: 1},
                 note=f"Tag from reflection: {tag.tag}",
             ))
-        
+
         delta = DeltaBatch(operations=all_ops, created_by="medical-curator-direct")
-        
+
         applied: List[str] = []
         if auto_apply:
             result = playbook.apply_delta(delta)
             applied = result.get("applied", [])
             skipped.extend(result.get("skipped", []))
-        
+
         return MedicalCuratorOutput(
             reasoning="Direct application of reflector proposals with deduplication",
             delta=delta,
@@ -687,7 +861,10 @@ class MedicalCurator:
                 "source": "direct",
                 "proposals_count": len(reflection.proposed_operations),
                 "retrieval_patterns_count": len(reflection.retrieval_patterns),
+                "exclusion_rules_count": len(reflection.exclusion_rules),
                 "bullet_tags_count": len(reflection.bullet_tags),
+                "is_correct": reflection.is_correct,
+                "error_type": reflection.error_type,
             },
             applied_ops=applied,
             skipped_ops=skipped,
